@@ -1992,6 +1992,18 @@ function parseCVSheet(rowData) {
     return null;
   }
 
+  const headerCells = rowData[headerIdx].values || [];
+  const hTexts = headerCells.map(c => (c.formattedValue || "").toLowerCase().trim());
+  const iDate     = hTexts.findIndex(h => h.includes("publish") || h.includes("date")) ?? 1;
+  const iId       = hTexts.findIndex(h => h === "id" || h.includes("video id")) ?? 2;
+  const iUploader = hTexts.findIndex(h => h.includes("upload")) ?? 3;
+  const iViews    = hTexts.findIndex(h => h.includes("view") || h.includes("vue"));
+  // Fallbacks positionnels
+  const _iDate     = iDate     >= 0 ? iDate     : 1;
+  const _iId       = iId       >= 0 ? iId       : 2;
+  const _iUploader = iUploader >= 0 ? iUploader : 3;
+  const _iViews    = iViews    >= 0 ? iViews    : 4;
+
   for (let i = headerIdx + 1; i < rowData.length; i++) {
     const cells = rowData[i].values || [];
     const get = idx => (cells[idx]?.formattedValue || "").trim();
@@ -1999,20 +2011,35 @@ function parseCVSheet(rowData) {
     const title = get(0);
     if (!title) continue;
 
-    const dateRaw  = get(1); // YYYY-MM-DD HH:MM
-    const colCRaw  = get(2); // ID vidéo (col C)
-    const uploader = get(3);
-    const views    = parseInt(get(4).replace(/[\s,]/g, ""), 10) || 0;
+    const dateRaw  = get(_iDate);
+    const colCRaw  = cells[_iId]?.userEnteredValue?.stringValue
+                  || cells[_iId]?.effectiveValue?.stringValue
+                  || get(_iId);
+    const uploader = get(_iUploader);
+    const _vCell   = cells[_iViews];
+    const views    = _vCell
+      ? Math.round(
+          (_vCell.userEnteredValue?.numberValue ?? _vCell.effectiveValue?.numberValue)
+          || parseFloat((_vCell.formattedValue || "").replace(/[^\d.]/g, ""))
+          || 0
+        )
+      : 0;
 
-    // Lien YouTube : depuis col A, ou depuis col C
+    // Lien YouTube : depuis col A (lien playlist ou vidéo), ou construire depuis l'ID
     const linkFromA = extractCellLink(cells[0]);
-    const linkFromC = extractCellLink(cells[2]);
-    const ytUrl = linkFromA || linkFromC || (colCRaw ? `https://www.youtube.com/watch?v=${colCRaw}` : null);
+    const linkFromC = extractCellLink(cells[_iId]);
+    // Préférer un lien direct vidéo (watch?v=) plutôt qu'une playlist
+    const directLink = [linkFromA, linkFromC].find(l => l && l.includes("watch?v="));
+    const ytUrl = directLink
+               || (colCRaw ? `https://www.youtube.com/watch?v=${colCRaw}` : null)
+               || linkFromA || linkFromC;
 
-    // ID vidéo : depuis col C d'abord, sinon depuis le lien de col A
-    const videoId = extractVideoId(colCRaw) || extractVideoId(linkFromA) || extractVideoId(linkFromC);
+    // ID vidéo : depuis la colonne ID (c'est l'ID brut), sinon extraire du lien
+    const videoId = (colCRaw && /^[A-Za-z0-9_-]{11}$/.test(colCRaw))
+                  ? colCRaw
+                  : extractVideoId(colCRaw) || extractVideoId(linkFromA) || extractVideoId(linkFromC);
 
-    // Formater la date : YYYY-MM-DD → DD-MM-YYYY
+    // Formater la date : "YYYY-MM-DD HH:MM" → "DD-MM-YYYY"
     let dateDisplay = "";
     let dateMs = 0;
     if (dateRaw) {
@@ -2048,7 +2075,7 @@ async function loadCVs(sheetNames) {
 // ── RENDER onglet CVs ──
 function renderCVsTab() {
   const grid = document.getElementById("grid");
-  const q    = state.search.toLowerCase().trim();
+  const q = state.search.toLowerCase().trim();
   const minViews = state.minViews || 0;
 
   const filtered = cvsData.filter(cv => {
@@ -2074,7 +2101,7 @@ function renderCVsTab() {
 
     // Thumbnail YouTube
     const thumbHtml = cv.videoId
-      ? `<div class="cv-list-thumb"><img src="https://img.youtube.com/vi/${cv.videoId}/mqdefault.jpg" alt="${cv.title}" loading="lazy" onerror="this.parentElement.style.display='none'"></div>`
+      ? `<div class="cv-list-thumb"><img src="https://img.youtube.com/vi/${cv.videoId}/hqdefault.jpg" alt="${cv.title}" loading="lazy" onerror="this.src='https://img.youtube.com/vi/${cv.videoId}/default.jpg'" ></div>`
       : "";
 
     card.innerHTML = `
@@ -2125,7 +2152,8 @@ function openCVProfile(cv) {
         </iframe>
       </div>` : ""}
       ${cv.ytUrl ? `<a href="${cv.ytUrl}" target="_blank" rel="noopener noreferrer" class="cv-watch-btn-large">
-        ${ICONS.yt} Voir sur YouTube
+        <svg viewBox="0 0 16 12" fill="currentColor" width="16" height="12"><path d="M15.6 1.9C15.4 1.1 14.8.5 14 .3 12.8 0 8 0 8 0S3.2 0 2 .3C1.2.5.6 1.1.4 1.9 0 3.2 0 6 0 6s0 2.8.4 4.1c.2.8.8 1.4 1.6 1.6C3.2 12 8 12 8 12s4.8 0 6-.3c.8-.2 1.4-.8 1.6-1.6C16 8.8 16 6 16 6s0-2.8-.4-4.1zM6.4 8.6V3.4L10.5 6 6.4 8.6z"/></svg>
+        Voir sur YouTube
         <svg viewBox="0 0 12 12" fill="none" width="11" height="11"><path d="M2.5 6h7m0 0L6 2.5M9.5 6L6 9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </a>` : ""}
     </div>`;
