@@ -1013,7 +1013,7 @@ body {
       <svg viewBox="0 0 16 16" fill="none" width="13" height="13"><path d="M2 6.5L8 2l6 4.5V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6.5z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6 15v-5h4v5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
       Home
     </button>
-    <button class="nav-btn active" id="nav-penspinners" onclick="state.section='Penspinners'; showPage('penspinners'); render();">
+    <button class="nav-btn active" id="nav-penspinners" onclick="switchToPenspinners()">
       <svg viewBox="0 0 16 16" fill="none" width="13" height="13"><circle cx="8" cy="5" r="3" stroke="currentColor" stroke-width="1.4"/><path d="M2 14c0-3.314 2.686-5 6-5s6 1.686 6 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
       Penspinners
     </button>
@@ -1089,24 +1089,24 @@ body {
     </div>
 
     <div class="sidebar-section" id="sidebar-views-section" style="display:none;">
-      <div class="sidebar-label">Vues</div>
+      <div class="sidebar-label">Vues YouTube</div>
       <div class="filter-group" id="views-filter">
-        <button class="filter-btn active" data-views="0">
+        <button type="button" class="filter-btn active" data-views-min="0">
           <span class="dot" style="background:#888"></span>Toutes
         </button>
-        <button class="filter-btn" data-views="1000">
+        <button type="button" class="filter-btn" data-views-min="1000">
           <span class="dot" style="background:var(--orange)"></span>&gt; 1 000
         </button>
-        <button class="filter-btn" data-views="5000">
+        <button type="button" class="filter-btn" data-views-min="5000">
           <span class="dot" style="background:var(--orange)"></span>&gt; 5 000
         </button>
-        <button class="filter-btn" data-views="10000">
+        <button type="button" class="filter-btn" data-views-min="10000">
           <span class="dot" style="background:var(--orange)"></span>&gt; 10 000
         </button>
-        <button class="filter-btn" data-views="50000">
+        <button type="button" class="filter-btn" data-views-min="50000">
           <span class="dot" style="background:var(--orange)"></span>&gt; 50 000
         </button>
-        <button class="filter-btn" data-views="100000">
+        <button type="button" class="filter-btn" data-views-min="100000">
           <span class="dot" style="background:var(--orange)"></span>&gt; 100 000
         </button>
       </div>
@@ -1223,14 +1223,44 @@ async function fetchSheetNames() {
 }
 
 async function fetchSheet(name) {
-  // includeGridData=true pour récupérer les hyperliens intégrés dans les cellules
-  const range = encodeURIComponent(`${name}!A1:J5000`);
-  const url = `${BASE}/${SHEET_ID}?ranges=${range}&includeGridData=true&key=${API_KEY}`;
-  const r = await fetch(url);
-  const d = await r.json();
-  if (d.error) throw new Error(d.error.message);
-  const rowData = d.sheets?.[0]?.data?.[0]?.rowData || [];
-  return rowData;
+  // Requête 1 : rapide, champs minimaux pour A:J (valeurs + hyperliens simples)
+  const rangeAJ = encodeURIComponent(`${name}!A1:J5000`);
+  const urlAJ = `${BASE}/${SHEET_ID}?ranges=${rangeAJ}&includeGridData=true&fields=sheets.data.rowData.values(formattedValue,hyperlink)&key=${API_KEY}`;
+
+  // Requête 2 : includeGridData complet mais UNIQUEMENT sur K:L (Drive + Blog)
+  // Beaucoup plus léger car seulement 2 colonnes — on garde textFormatRuns pour les multi-hyperliens
+  const rangeKL = encodeURIComponent(`${name}!K1:L5000`);
+  const urlKL = `${BASE}/${SHEET_ID}?ranges=${rangeKL}&includeGridData=true&fields=sheets.data.rowData.values(formattedValue,hyperlink,textFormatRuns)&key=${API_KEY}`;
+
+  const [rAJ, rKL] = await Promise.all([fetch(urlAJ), fetch(urlKL)]);
+  const [dAJ, dKL] = await Promise.all([rAJ.json(), rKL.json()]);
+
+  if (dAJ.error) throw new Error(dAJ.error.message);
+  if (dKL.error) throw new Error(dKL.error.message);
+
+  const rowsAJ = dAJ.sheets?.[0]?.data?.[0]?.rowData || [];
+  const rowsKL = dKL.sheets?.[0]?.data?.[0]?.rowData || [];
+
+  // Fusion : on ajoute les cellules K (index 10) et L (index 11) à chaque ligne A:J
+  const merged = rowsAJ.map((row, i) => {
+    const drCell = rowsKL[i]?.values?.[0] || null; // K
+    const blCell = rowsKL[i]?.values?.[1] || null; // L
+    const values = [...(row.values || [])];
+    while (values.length < 10) values.push(null);
+    values[10] = drCell;
+    values[11] = blCell;
+    return { values };
+  });
+
+  // Lignes K/L supplémentaires si rowsKL est plus long
+  for (let i = rowsAJ.length; i < rowsKL.length; i++) {
+    const values = new Array(10).fill(null);
+    values[10] = rowsKL[i]?.values?.[0] || null;
+    values[11] = rowsKL[i]?.values?.[1] || null;
+    merged.push({ values });
+  }
+
+  return merged;
 }
 
 // Extrait le texte affiché + l'URL d'une cellule (hyperlink intégré ou texte brut)
@@ -1241,6 +1271,58 @@ function cellValue(cell) {
   // Si pas d'hyperlink mais le texte ressemble à une URL, on l'utilise directement
   const resolvedUrl = url || (text.startsWith("http") ? text : null);
   return { text, url: resolvedUrl };
+}
+
+// Extrait TOUS les liens d'une cellule (multi-hyperliens ou multi-URLs séparées par virgules)
+// Retourne [{ url, label }] où label est le texte affiché du lien (peut être vide)
+function extractAllLinks(cell) {
+  if (!cell) return [];
+  const out = [];
+  const seen = new Set(); // dédoublonner par URL
+  const fullText = (cell.formattedValue || "").trim();
+
+  const push = (url, label) => {
+    if (!url) return;
+    const u = url.trim();
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    // Nettoie le label : si c'est l'URL elle-même, on le vide
+    const cleanLabel = (label && !label.startsWith("http") ? label.trim() : "");
+    out.push({ url: u, label: cleanLabel });
+  };
+
+  // 1) textFormatRuns : plusieurs liens posés sur des portions du texte
+  // Exemple : "Drive principal, Drive backup" avec 2 hyperliens distincts
+  if (Array.isArray(cell.textFormatRuns) && cell.textFormatRuns.length > 0 && fullText) {
+    const runs = cell.textFormatRuns;
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      const start = run.startIndex || 0;
+      const end = (i + 1 < runs.length) ? (runs[i + 1].startIndex || fullText.length) : fullText.length;
+      const segText = fullText.substring(start, end).replace(/^[\s,;|/]+|[\s,;|/]+$/g, "");
+      const linkUri = run.format?.link?.uri;
+      if (linkUri) push(linkUri, segText);
+    }
+  }
+
+  // 2) Hyperlink global de la cellule (un seul lien posé sur toute la cellule)
+  if (cell.hyperlink) push(cell.hyperlink, fullText);
+
+  // 3) Lien dans userEnteredFormat / effectiveFormat
+  const fmtUri = cell.userEnteredFormat?.textFormat?.link?.uri
+              || cell.effectiveFormat?.textFormat?.link?.uri;
+  if (fmtUri) push(fmtUri, fullText);
+
+  // 4) Texte brut : peut contenir plusieurs URLs séparées par virgules / espaces / sauts de ligne
+  if (fullText) {
+    // Regex large : http/https jusqu'au prochain séparateur
+    const urlMatches = fullText.match(/https?:\/\/[^\s,;|<>"'\)\]]+/gi);
+    if (urlMatches) {
+      urlMatches.forEach(u => push(u, ""));
+    }
+  }
+
+  return out;
 }
 
 // ── CLASSIFICATION ALPHABÉTIQUE ──
@@ -1307,8 +1389,11 @@ function parseSheet(rowData) {
   const cYt    = col("youtube", "yt");
   const cTw    = col("twitter", "tw");
   const cDm    = col("dailymotion", "dm");
-  const cDr    = col("drive");
-  const cBl    = col("blog");
+  let cDr      = col("drive");
+  let cBl      = col("blog");
+  // Fallback positionnel : Drive=K (10), Blog=L (11) selon la structure documentée
+  if (cDr < 0) cDr = 10;
+  if (cBl < 0) cBl = 11;
   const cSubs    = col("subscribers", "abonnés", "subs");
   const cExcl    = col("exclude", "exclure", "exception");
   // Statuts : cherche par libellé, avec fallback positionnel (G=6 pour YT, I=8 pour Twitter)
@@ -1391,11 +1476,27 @@ function parseSheet(rowData) {
       }
     };
 
+    // Variante multi-liens : extrait TOUS les liens d'une cellule (Drive, Blog)
+    // Gère : plusieurs hyperliens posés sur des portions de texte, ou plusieurs URLs en texte brut séparées par virgules
+    const addMultiLinks = (type, idx) => {
+      if (idx < 0) return;
+      const cell = cells[idx];
+      if (!cell) return;
+      const links = extractAllLinks(cell);
+      links.forEach(({ url, label }) => {
+        // Dédoublonnage global sur l'entry
+        const existing = entry.links.find(l => l.url === url);
+        if (!existing) {
+          entry.links.push({ type, url, label, status: "" });
+        }
+      });
+    };
+
     addLink("yt", cYt, rowYtStat);
     addLink("tw", cTw, rowTwStat);
     addLink("dm", cDm, "");
-    addLink("dr", cDr, "");
-    addLink("bl", cBl, "");
+    addMultiLinks("dr", cDr);
+    addMultiLinks("bl", cBl);
   }
 
   return Array.from(map.values()).filter(e => e.name);
@@ -1446,6 +1547,8 @@ function render() {
   if (alphaGrid)  alphaGrid.closest(".sidebar-section").style.display  = isCVs ? "none" : "";
   if (platformSec) platformSec.style.display = isCVs ? "none" : "";
   if (viewsSec)    viewsSec.style.display    = isCVs ? "" : "none";
+  const sectionTabsContainer = document.getElementById("section-tabs")?.closest("div");
+  if (sectionTabsContainer) sectionTabsContainer.style.display = isCVs ? "none" : "";
 
   // Si onglet CVs actif, déléguer
   if (isCVs) { renderCVsTab(); return; }
@@ -1625,7 +1728,9 @@ function makeCard(entry) {
         a.dataset.tooltip = STATUS_LABELS[status].tooltip;
       }
       // Affiche le nom de la chaîne si disponible, sinon le label générique
-      const label = l.label
+      // Pour Drive et Blog : on force toujours le label générique "Drive"/"Blog" (numéroté si plusieurs)
+      const useGenericLabel = (type === "dr" || type === "bl");
+      const label = (!useGenericLabel && l.label)
         ? l.label
         : (links.length > 1 ? `${LINK_LABELS[type]} ${i + 1}` : LINK_LABELS[type]);
       const badgeHtml = STATUS_LABELS[status]
@@ -1658,8 +1763,6 @@ async function loadAll() {
     found.forEach(t => {
       sheetMap[t] = sheetNames.find(n => n.trim().toLowerCase() === t.toLowerCase()).trim();
     });
-
-    console.log("Onglets trouvés :", JSON.stringify(sheetMap));
 
     // Load all sheets
     for (const target of found) {
@@ -1707,11 +1810,22 @@ document.querySelectorAll("#subs-filter .filter-btn").forEach(b => {
   });
 });
 
-document.querySelectorAll("#views-filter .filter-btn").forEach(b => {
-  b.addEventListener("click", () => {
-    state.minViews = parseInt(b.dataset.views, 10);
+// ── FILTRE VUES (onglet CV) ──
+// Réinitialise visuellement le filtre vues sur "Toutes" (sans déclencher render)
+function resetViewsFilter() {
+  state.minViews = 0;
+  document.querySelectorAll("#views-filter .filter-btn").forEach(x =>
+    x.classList.toggle("active", x.dataset.viewsMin === "0")
+  );
+}
+
+// Bind des clics sur les boutons du filtre vues
+document.querySelectorAll("#views-filter .filter-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const min = parseInt(btn.dataset.viewsMin, 10);
+    state.minViews = isNaN(min) ? 0 : min;
     document.querySelectorAll("#views-filter .filter-btn").forEach(x => x.classList.remove("active"));
-    b.classList.add("active");
+    btn.classList.add("active");
     render();
   });
 });
@@ -1729,12 +1843,10 @@ document.querySelectorAll(".section-tab").forEach(b => {
   b.addEventListener("click", () => {
     state.section = b.dataset.section;
     state.letter = "all";
-    state.minViews = 0;
+    resetViewsFilter();
     document.querySelectorAll(".section-tab").forEach(x => x.classList.remove("active"));
     b.classList.add("active");
     document.querySelectorAll(".alpha-btn").forEach(x => x.classList.toggle("active", x.dataset.letter === "all"));
-    // Reset views filter UI
-    document.querySelectorAll("#views-filter .filter-btn").forEach(x => x.classList.toggle("active", x.dataset.views === "0"));
     render();
   });
 });
@@ -1764,18 +1876,44 @@ function showPage(page) {
 }
 
 // ── SWITCH SECTION (depuis nav header) ──
+function switchToPenspinners() {
+  state.section = "Penspinners";
+  state.letter = "all";
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById("nav-penspinners").classList.add("active");
+  document.getElementById("home-page").style.display = "none";
+  document.getElementById("cv-page").style.display = "none";
+  document.getElementById("profile-page").style.display = "none";
+  document.getElementById("list-page").style.display = "block";
+  const sectionTabsContainer = document.getElementById("section-tabs")?.closest("div");
+  if (sectionTabsContainer) sectionTabsContainer.style.display = "";
+  document.querySelectorAll(".section-tab").forEach(x => x.classList.toggle("active", x.dataset.section === "Penspinners"));
+  document.querySelectorAll(".alpha-btn").forEach(x => x.classList.toggle("active", x.dataset.letter === "all"));
+  // Restaurer placeholder
+  const searchInput = document.getElementById("search-input");
+  if (searchInput) searchInput.placeholder = "Rechercher un penspinner, alias, communauté…";
+  render();
+}
+
 function switchToSection(sectionName) {
-  showPage("penspinners");
   state.section = sectionName;
   state.letter = "all";
-  state.minViews = 0;
-  // Masquer/afficher la barre d'onglets Penspinners/Various selon le contexte
-  document.getElementById("section-tabs").style.display = sectionName === "CVs" ? "none" : "";
-  document.querySelectorAll(".section-tab").forEach(x => x.classList.toggle("active", x.dataset.section === sectionName));
-  document.querySelectorAll(".alpha-btn").forEach(x => x.classList.toggle("active", x.dataset.letter === "all"));
-  document.querySelectorAll("#views-filter .filter-btn").forEach(x => x.classList.toggle("active", x.dataset.views === "0"));
+  resetViewsFilter();
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
   document.getElementById("nav-cv").classList.add("active");
+  document.getElementById("home-page").style.display = "none";
+  document.getElementById("cv-page").style.display = "none";
+  document.getElementById("profile-page").style.display = "none";
+  document.getElementById("list-page").style.display = "block";
+  const sectionTabsContainer = document.getElementById("section-tabs")?.closest("div");
+  if (sectionTabsContainer) sectionTabsContainer.style.display = sectionName === "CVs" ? "none" : "";
+  // Adapter le placeholder de recherche
+  const searchInput = document.getElementById("search-input");
+  if (searchInput) {
+    searchInput.placeholder = sectionName === "CVs"
+      ? "Rechercher une CV par titre ou uploader…"
+      : "Rechercher un penspinner, alias, communauté…";
+  }
   render();
 }
 
@@ -1873,7 +2011,10 @@ function openProfile(entry) {
     if (!links) return;
     linksHtml += `<div class="profile-section-title">${LINK_TYPE_LABELS[type]}</div><div class="profile-links-grid">`;
     links.forEach((l, i) => {
-      const label = l.label || (links.length > 1 ? `${LINK_TYPE_LABELS[type]} ${i + 1}` : LINK_TYPE_LABELS[type]);
+      const useGenericLabel = (type === "dr" || type === "bl");
+      const label = (!useGenericLabel && l.label)
+        ? l.label
+        : (links.length > 1 ? `${LINK_TYPE_LABELS[type]} ${i + 1}` : LINK_TYPE_LABELS[type]);
       const status = normalizeStatus(l.status);
       const statusClass = status ? " status-" + status : "";
       const isClickable = !status || status === "ok" || status === "vide" || status === "prive";
@@ -1908,7 +2049,11 @@ function closeProfile() {
   document.getElementById("list-page").style.display = "block";
   document.getElementById("profile-page").style.display = "none";
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
-  document.getElementById("nav-penspinners").classList.add("active");
+  if (state.section === "CVs") {
+    document.getElementById("nav-cv").classList.add("active");
+  } else {
+    document.getElementById("nav-penspinners").classList.add("active");
+  }
 }
 
 document.getElementById("profile-back").addEventListener("click", closeProfile);
@@ -1931,16 +2076,84 @@ let cvsData = []; // [{title, ytUrl, videoId, date, dateRaw, uploader, views}]
 let currentCVEntry = null; // CV actuellement affichée en profil
 
 // ── FETCH du sheet CVs (sheet séparé) ──
+// Utilise values.get (endpoint léger) avec deux passes : FORMULA + FORMATTED_VALUE
+// Permet de récupérer toutes les lignes sans la limite de includeGridData
 async function fetchCVSheet() {
+  // 1. Récupérer le nom de l'onglet
   const metaUrl = `${BASE}/${CV_SHEET_ID}?fields=sheets.properties&key=${API_KEY}`;
   const metaD = await (await fetch(metaUrl)).json();
   if (metaD.error) throw new Error("CV meta: " + metaD.error.message);
-  const sheetTitle = metaD.sheets?.[0]?.properties?.title || "Sheet1";
-  const range = encodeURIComponent(`${sheetTitle}!A1:E5000`);
-  const url = `${BASE}/${CV_SHEET_ID}?ranges=${range}&includeGridData=true&key=${API_KEY}`;
-  const d = await (await fetch(url)).json();
-  if (d.error) throw new Error("CV sheet: " + d.error.message);
-  return d.sheets?.[0]?.data?.[0]?.rowData || [];
+  // Recherche de l'onglet par priorité :
+  //   1. Onglet contenant "2006" et "2025" (le bon onglet principal)
+  //   2. Onglet contenant "Compiled" mais ni "Indep" ni "Obsolete/Obsoelete"
+  //   3. Onglet contenant "Compiled" (par défaut)
+  //   4. Premier onglet
+  const allSheets = metaD.sheets || [];
+  let targetSheet =
+    allSheets.find(s => /2006.*2025|2025.*2006/.test(s.properties.title))
+    || allSheets.find(s => {
+         const t = s.properties.title.toLowerCase();
+         return t.includes("compiled") && !t.includes("indep") && !t.includes("obsol");
+       })
+    || allSheets.find(s => s.properties.title.toLowerCase().includes("compiled"))
+    || allSheets[0];
+
+  const sheetTitle = targetSheet?.properties?.title || "Sheet1";
+  const totalRows = targetSheet?.properties?.gridProperties?.rowCount;
+  console.log(`[CVs] Onglet : "${sheetTitle}" (${totalRows} lignes)`);
+
+  // 2. Trois requêtes values.get parallèles (très légères, pas de limite de taille)
+  const range = encodeURIComponent(`${sheetTitle}!A1:E${totalRows || 10000}`);
+  const urlFormula    = `${BASE}/${CV_SHEET_ID}/values/${range}?valueRenderOption=FORMULA&key=${API_KEY}`;
+  const urlFormatted  = `${BASE}/${CV_SHEET_ID}/values/${range}?valueRenderOption=FORMATTED_VALUE&key=${API_KEY}`;
+  const urlUnformatted= `${BASE}/${CV_SHEET_ID}/values/${range}?valueRenderOption=UNFORMATTED_VALUE&key=${API_KEY}`;
+
+  const [rFormula, rFormatted, rUnformatted] = await Promise.all([
+    fetch(urlFormula).then(r => r.json()),
+    fetch(urlFormatted).then(r => r.json()),
+    fetch(urlUnformatted).then(r => r.json()),
+  ]);
+
+  if (rFormula.error)     throw new Error("CV formula: " + rFormula.error.message);
+  if (rFormatted.error)   throw new Error("CV formatted: " + rFormatted.error.message);
+  if (rUnformatted.error) throw new Error("CV unformatted: " + rUnformatted.error.message);
+
+  const formulaRows     = rFormula.values     || [];
+  const formattedRows   = rFormatted.values   || [];
+  const unformattedRows = rUnformatted.values || [];
+
+  // 3. Recombiner ligne par ligne en un format compatible avec parseCVSheet
+  // On crée un faux rowData[].values[] avec les champs nécessaires
+  const maxLen = Math.max(formulaRows.length, formattedRows.length, unformattedRows.length);
+  const rowData = [];
+  for (let i = 0; i < maxLen; i++) {
+    const fr = formulaRows[i]     || [];
+    const ft = formattedRows[i]   || [];
+    const uf = unformattedRows[i] || [];
+    const cells = [];
+    const colCount = Math.max(fr.length, ft.length, uf.length, 5);
+    for (let j = 0; j < colCount; j++) {
+      const formula     = fr[j];
+      const formatted   = ft[j];
+      const unformatted = uf[j];
+      // Construire une cellule "synthétique" qui ressemble à ce que includeGridData renvoyait
+      const cell = {};
+      if (formatted !== undefined && formatted !== null && formatted !== "") {
+        cell.formattedValue = String(formatted);
+      }
+      if (typeof formula === "string" && formula.startsWith("=")) {
+        cell.userEnteredValue = { formulaValue: formula };
+      } else if (typeof unformatted === "number") {
+        cell.userEnteredValue = { numberValue: unformatted };
+        cell.effectiveValue = { numberValue: unformatted };
+      } else if (unformatted !== undefined && unformatted !== null) {
+        cell.userEnteredValue = { stringValue: String(unformatted) };
+      }
+      cells.push(cell);
+    }
+    rowData.push({ values: cells });
+  }
+  return rowData;
 }
 
 // ── PARSE le sheet CVs ──
@@ -1948,98 +2161,254 @@ function parseCVSheet(rowData) {
   if (!rowData || rowData.length < 2) return [];
   const results = [];
 
-  // Détecter ligne d'en-tête
+  // ─── Helpers extraction ───
+
+  // Parse une formule =HYPERLINK("url", "label") et retourne {url, label}
+  // Gère aussi les variantes : guillemets simples/doubles, espaces, casse, etc.
+  function parseHyperlinkFormula(formula) {
+    if (!formula || typeof formula !== "string") return null;
+    const f = formula.trim();
+    if (!/^=\s*hyperlink\s*\(/i.test(f)) return null;
+    // Match : =HYPERLINK("url", "label")  ou  =HYPERLINK("url"; "label")  ou  =HYPERLINK("url")
+    // Tolère : guillemets doubles ou simples, séparateur , ou ;
+    const m = f.match(/^=\s*hyperlink\s*\(\s*["']([^"']*)["']\s*(?:[,;]\s*["']([^"']*)["']\s*)?\)/i);
+    if (m) return { url: m[1], label: m[2] || "" };
+    return null;
+  }
+
+  // Récupère le texte d'une cellule depuis toutes les sources possibles
+  // y compris en parsant les formules =HYPERLINK("url", "label") → label
+  function cellText(cell) {
+    if (!cell) return "";
+    // 1. Valeurs directes
+    const direct = (
+      cell.formattedValue ||
+      cell.userEnteredValue?.stringValue ||
+      cell.effectiveValue?.stringValue ||
+      ""
+    ).toString().trim();
+    if (direct) return direct;
+    // 2. Formule HYPERLINK : extraire le label
+    const formula = cell.userEnteredValue?.formulaValue;
+    if (formula) {
+      const parsed = parseHyperlinkFormula(formula);
+      if (parsed && parsed.label) return parsed.label.trim();
+    }
+    return "";
+  }
+
+  // Récupère un nombre depuis une cellule, robuste face aux formats variés
+  function cellNumber(cell) {
+    if (!cell) return 0;
+    // 1. Valeur numérique pure dans le sheet
+    const n1 = cell.userEnteredValue?.numberValue;
+    if (typeof n1 === "number" && !isNaN(n1)) return Math.round(n1);
+    const n2 = cell.effectiveValue?.numberValue;
+    if (typeof n2 === "number" && !isNaN(n2)) return Math.round(n2);
+    // 2. Valeur texte → parser en gérant K/M, virgules, espaces, points de milliers
+    const raw = cellText(cell);
+    if (!raw) return 0;
+    return parseViewCount(raw);
+  }
+
+  // Parse un texte représentant un nombre de vues
+  // Gère : "1234", "1,234", "1 234", "1.2K", "5M", "12.5k", "1 234 567"
+  function parseViewCount(str) {
+    if (!str) return 0;
+    let s = String(str).trim().toLowerCase();
+    if (!s) return 0;
+    // Détecter suffixe k/m/b
+    let multiplier = 1;
+    if (/[km b]$/.test(s)) {
+      const last = s.slice(-1);
+      if (last === "k") { multiplier = 1000;       s = s.slice(0, -1); }
+      else if (last === "m") { multiplier = 1e6;   s = s.slice(0, -1); }
+      else if (last === "b") { multiplier = 1e9;   s = s.slice(0, -1); }
+    }
+    // Nettoyer : enlever espaces (séparateurs de milliers)
+    s = s.replace(/\s/g, "").replace(/\u00a0/g, "").replace(/\u202f/g, "");
+    // Si point + virgule présents : le séparateur de décimale est le dernier des deux
+    // Exemple : "1,234.56" (US) ou "1.234,56" (FR)
+    const hasDot = s.includes(".");
+    const hasComma = s.includes(",");
+    if (hasDot && hasComma) {
+      const lastDot = s.lastIndexOf(".");
+      const lastComma = s.lastIndexOf(",");
+      if (lastDot > lastComma) {
+        // US : virgule = milliers
+        s = s.replace(/,/g, "");
+      } else {
+        // FR : point = milliers
+        s = s.replace(/\./g, "").replace(",", ".");
+      }
+    } else if (hasComma) {
+      // Virgule seule : milliers si suivi de 3 chiffres exactement, sinon décimale
+      const parts = s.split(",");
+      if (parts.length === 2 && parts[1].length === 3 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+        // Probablement milliers : "1,234"
+        s = s.replace(",", "");
+      } else if (parts.every(p => /^\d{3}$/.test(p)) || parts.slice(1).every(p => /^\d{3}$/.test(p))) {
+        // Plusieurs séparateurs de milliers : "1,234,567"
+        s = s.replace(/,/g, "");
+      } else {
+        // Décimale FR : "1,2"
+        s = s.replace(",", ".");
+      }
+    } else if (hasDot) {
+      // Point seul : milliers si suivi de 3 chiffres exactement
+      const parts = s.split(".");
+      if (parts.length === 2 && parts[1].length === 3 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+        s = s.replace(".", "");
+      } else if (parts.length > 2 && parts.slice(1).every(p => /^\d{3}$/.test(p))) {
+        s = s.replace(/\./g, "");
+      }
+      // Sinon : décimale (laisser)
+    }
+    const n = parseFloat(s);
+    if (isNaN(n)) return 0;
+    return Math.round(n * multiplier);
+  }
+
+  // Extrait un lien YouTube depuis une cellule (toutes sources possibles)
+  function extractCellLink(cell) {
+    if (!cell) return null;
+    // 1. Hyperlink direct (insertion via Insert→Link)
+    if (cell.hyperlink) return cell.hyperlink;
+    // 2. textFormatRuns (lien posé sur une portion du texte)
+    if (cell.textFormatRuns) {
+      for (const run of cell.textFormatRuns) {
+        const uri = run.format?.link?.uri;
+        if (uri) return uri;
+      }
+    }
+    // 3. textFormat global
+    const uef = cell.userEnteredFormat?.textFormat?.link?.uri;
+    if (uef) return uef;
+    const eff = cell.effectiveFormat?.textFormat?.link?.uri;
+    if (eff) return eff;
+    // 4. Formule =HYPERLINK("url", "label") → extraire url
+    const formula = cell.userEnteredValue?.formulaValue;
+    if (formula) {
+      const parsed = parseHyperlinkFormula(formula);
+      if (parsed && parsed.url) return parsed.url;
+    }
+    // 5. Texte brut qui ressemble à une URL
+    const text = cellText(cell);
+    if (text.match(/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)/)) return text;
+    return null;
+  }
+
+  // Extrait l'ID vidéo (11 chars alphanum) depuis une URL ou un ID brut
+  function extractVideoId(raw) {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+    const m1 = s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+    if (m1) return m1[1];
+    const m2 = s.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+    if (m2) return m2[1];
+    const m3 = s.match(/\/embed\/([A-Za-z0-9_-]{11})/);
+    if (m3) return m3[1];
+    return null;
+  }
+
+  // ─── Détection ligne d'en-tête ───
   let headerIdx = 0;
   for (let i = 0; i < Math.min(5, rowData.length); i++) {
-    const texts = (rowData[i].values || []).map(c => (c.formattedValue || "").toLowerCase());
-    if (texts.some(t => t.includes("titre") || t.includes("title") || t.includes("name") || t.includes("id") || t.includes("upload"))) {
+    const texts = (rowData[i].values || []).map(c => cellText(c).toLowerCase());
+    if (texts.some(t =>
+      t.includes("titre") || t.includes("title") ||
+      t.includes("upload") || t.includes("view") || t.includes("vue")
+    )) {
       headerIdx = i;
       break;
     }
   }
 
-  // Extrait le premier lien YouTube depuis une cellule (hyperlink, textFormatRuns, ou texte brut)
-  function extractCellLink(cell) {
-    if (!cell) return null;
-    // 1. Hyperlink direct sur la cellule
-    if (cell.hyperlink) return cell.hyperlink;
-    // 2. Liens dans les runs de texte formaté
-    if (cell.textFormatRuns) {
-      for (const run of cell.textFormatRuns) {
-        if (run.format?.link?.uri) return run.format.link.uri;
-      }
-    }
-    // 3. Texte brut qui ressemble à une URL YouTube
-    const text = (cell.formattedValue || "").trim();
-    if (text.match(/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)/)) return text;
-    return null;
-  }
-
-  // Extrait l'ID vidéo depuis une URL YouTube ou un ID brut
-  function extractVideoId(raw) {
-    if (!raw) return null;
-    // Si c'est déjà un ID (11 chars alphanum)
-    if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
-    // youtu.be/ID
-    const m1 = raw.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
-    if (m1) return m1[1];
-    // youtube.com/watch?v=ID
-    const m2 = raw.match(/[?&]v=([A-Za-z0-9_-]{11})/);
-    if (m2) return m2[1];
-    // youtube.com/embed/ID
-    const m3 = raw.match(/\/embed\/([A-Za-z0-9_-]{11})/);
-    if (m3) return m3[1];
-    return null;
-  }
-
   const headerCells = rowData[headerIdx].values || [];
-  const hTexts = headerCells.map(c => (c.formattedValue || "").toLowerCase().trim());
-  const iDate     = hTexts.findIndex(h => h.includes("publish") || h.includes("date")) ?? 1;
-  const iId       = hTexts.findIndex(h => h === "id" || h.includes("video id")) ?? 2;
-  const iUploader = hTexts.findIndex(h => h.includes("upload")) ?? 3;
+  const hTexts = headerCells.map(c => cellText(c).toLowerCase());
+  const iDate     = hTexts.findIndex(h => h.includes("publish") || h.includes("date"));
+  const iId       = hTexts.findIndex(h => h === "id" || h.includes("video id"));
+  const iUploader = hTexts.findIndex(h => h.includes("upload"));
   const iViews    = hTexts.findIndex(h => h.includes("view") || h.includes("vue"));
-  // Fallbacks positionnels
+  // Fallback positionnel : A=titre B=date C=ID D=uploader E=vues
+  const _iTitle    = 0;
   const _iDate     = iDate     >= 0 ? iDate     : 1;
   const _iId       = iId       >= 0 ? iId       : 2;
   const _iUploader = iUploader >= 0 ? iUploader : 3;
   const _iViews    = iViews    >= 0 ? iViews    : 4;
 
+  // ─── Parcours des lignes ───
+  let stats = { total: 0, kept: 0, droppedNoTitle: 0, droppedEmpty: 0 };
+
   for (let i = headerIdx + 1; i < rowData.length; i++) {
-    const cells = rowData[i].values || [];
-    const get = idx => (cells[idx]?.formattedValue || "").trim();
+    stats.total++;
+    const cells = (rowData[i] && rowData[i].values) || [];
 
-    const title = get(0);
-    if (!title) continue;
+    // Ligne complètement vide → on saute mais on ne s'arrête pas (peut y avoir des trous)
+    if (!cells.length) {
+      stats.droppedEmpty++;
+      continue;
+    }
 
-    const dateRaw  = get(_iDate);
-    const colCRaw  = cells[_iId]?.userEnteredValue?.stringValue
-                  || cells[_iId]?.effectiveValue?.stringValue
-                  || get(_iId);
-    const uploader = get(_iUploader);
-    const _vCell   = cells[_iViews];
-    const views    = _vCell
-      ? Math.round(
-          (_vCell.userEnteredValue?.numberValue ?? _vCell.effectiveValue?.numberValue)
-          || parseFloat((_vCell.formattedValue || "").replace(/[^\d.]/g, ""))
-          || 0
-        )
-      : 0;
+    // ─── Titre : check toutes les sources, et accepter même si juste un lien ───
+    const titleCell = cells[_iTitle];
+    let title = cellText(titleCell);
 
-    // Lien YouTube : depuis col A (lien playlist ou vidéo), ou construire depuis l'ID
-    const linkFromA = extractCellLink(cells[0]);
-    const linkFromC = extractCellLink(cells[_iId]);
-    // Préférer un lien direct vidéo (watch?v=) plutôt qu'une playlist
+    // Si pas de texte, mais il y a un lien → on garde une CV "sans titre" reconnaissable
+    if (!title) {
+      const link = extractCellLink(titleCell);
+      if (link) {
+        // Tenter d'extraire l'ID vidéo pour servir de titre de secours
+        const vid = extractVideoId(link);
+        title = vid ? `[Sans titre — ${vid}]` : "[Sans titre]";
+      } else {
+        // Vérifier s'il y a quand même un ID vidéo en col C → CV exploitable
+        const _idCell = cells[_iId];
+        const idText = cellText(_idCell);
+        if (idText && /^[A-Za-z0-9_-]{11}$/.test(idText)) {
+          title = `[Sans titre — ${idText}]`;
+        } else {
+          stats.droppedNoTitle++;
+          continue;
+        }
+      }
+    }
+
+    // ─── Date ───
+    const dateRaw = cellText(cells[_iDate]);
+
+    // ─── ID vidéo (col C) ───
+    const idCell = cells[_iId];
+    const colCRaw = idCell?.userEnteredValue?.stringValue
+                 || idCell?.effectiveValue?.stringValue
+                 || cellText(idCell);
+
+    // ─── Uploader ───
+    const uploader = cellText(cells[_iUploader]);
+
+    // ─── Vues ───
+    const views = cellNumber(cells[_iViews]);
+
+    // ─── Lien YouTube ───
+    const linkFromA = extractCellLink(cells[_iTitle]);
+    const linkFromC = extractCellLink(idCell);
     const directLink = [linkFromA, linkFromC].find(l => l && l.includes("watch?v="));
     const ytUrl = directLink
-               || (colCRaw ? `https://www.youtube.com/watch?v=${colCRaw}` : null)
-               || linkFromA || linkFromC;
+               || (colCRaw && /^[A-Za-z0-9_-]{11}$/.test(colCRaw)
+                   ? `https://www.youtube.com/watch?v=${colCRaw}`
+                   : null)
+               || linkFromA
+               || linkFromC;
 
-    // ID vidéo : depuis la colonne ID (c'est l'ID brut), sinon extraire du lien
+    // ─── ID vidéo extrait ───
     const videoId = (colCRaw && /^[A-Za-z0-9_-]{11}$/.test(colCRaw))
                   ? colCRaw
-                  : extractVideoId(colCRaw) || extractVideoId(linkFromA) || extractVideoId(linkFromC);
+                  : extractVideoId(colCRaw)
+                 || extractVideoId(linkFromA)
+                 || extractVideoId(linkFromC);
 
-    // Formater la date : "YYYY-MM-DD HH:MM" → "DD-MM-YYYY"
+    // ─── Date : "YYYY-MM-DD HH:MM" → "DD-MM-YYYY" ───
     let dateDisplay = "";
     let dateMs = 0;
     if (dateRaw) {
@@ -2053,10 +2422,18 @@ function parseCVSheet(rowData) {
     }
 
     results.push({ title, ytUrl, videoId, dateRaw, dateDisplay, dateMs, uploader, views });
+    stats.kept++;
   }
 
-  // Trier du plus récent au plus vieux
-  results.sort((a, b) => b.dateMs - a.dateMs);
+  // Tri du plus récent au plus ancien (lignes sans date à la fin)
+  results.sort((a, b) => {
+    if (!a.dateMs && !b.dateMs) return 0;
+    if (!a.dateMs) return 1;
+    if (!b.dateMs) return -1;
+    return b.dateMs - a.dateMs;
+  });
+
+  console.log(`[CVs] ${stats.kept} chargées sur ${stats.total} lignes`);
   return results;
 }
 
@@ -2066,7 +2443,8 @@ async function loadCVs(sheetNames) {
   try {
     const rowData = await fetchCVSheet();
     cvsData = parseCVSheet(rowData);
-    console.log("CVs chargées :", cvsData.length);
+    // Re-render si l'onglet CVs est actif au moment où les données arrivent
+    if (state.section === "CVs") render();
   } catch(e) {
     console.error("Erreur chargement CVs:", e.message);
   }
@@ -2075,41 +2453,80 @@ async function loadCVs(sheetNames) {
 // ── RENDER onglet CVs ──
 function renderCVsTab() {
   const grid = document.getElementById("grid");
+  const countEl = document.getElementById("results-count");
   const q = state.search.toLowerCase().trim();
-  const minViews = state.minViews || 0;
 
-  const filtered = cvsData.filter(cv => {
-    if (minViews > 0 && cv.views < minViews) return false;
-    if (!q) return true;
-    return cv.title.toLowerCase().includes(q)
-      || (cv.uploader || "").toLowerCase().includes(q);
+  // Récupérer le seuil de vues actif (lu DEPUIS LE DOM, pas du state pour éviter les désyncs)
+  const activeBtn = document.querySelector("#views-filter .filter-btn.active");
+  const minViews = activeBtn ? (parseInt(activeBtn.dataset.viewsMin, 10) || 0) : 0;
+  state.minViews = minViews; // resync
+
+  // Si les CVs ne sont pas encore chargées, afficher un loader
+  if (!cvsData.length) {
+    if (countEl) countEl.innerHTML = "";
+    grid.innerHTML = `<div class="state-loading"><div class="spinner"></div>Chargement des CVs…</div>`;
+    return;
+  }
+
+  // ─── FILTRAGE ───
+  // 1. Filtre par seuil de vues
+  // 2. Filtre par recherche texte (titre ou uploader)
+  const cvFiltered = cvsData.filter(cv => {
+    // Filtre vues : on compare le nombre de vues stocké dans cv.views
+    // (déjà parsé proprement par cellNumber dans parseCVSheet)
+    const v = typeof cv.views === "number" && !isNaN(cv.views) ? cv.views : 0;
+    if (minViews > 0 && v < minViews) return false;
+
+    // Filtre recherche
+    if (q) {
+      const inTitle = (cv.title || "").toLowerCase().includes(q);
+      const inUploader = (cv.uploader || "").toLowerCase().includes(q);
+      if (!inTitle && !inUploader) return false;
+    }
+    return true;
   });
 
-  document.getElementById("results-count").innerHTML =
-    `<strong>${filtered.length.toLocaleString()}</strong> CV${filtered.length > 1 ? "s" : ""}`;
+  // ─── COMPTEUR ───
+  const totalLabel = `<strong>${cvFiltered.length.toLocaleString("fr-FR").replace(/\u202f/g, " ")}</strong> CV${cvFiltered.length > 1 ? "s" : ""}`;
+  const filterLabel = minViews > 0
+    ? ` <span style="color:var(--faint)">· filtre &gt; ${minViews.toLocaleString("fr-FR").replace(/\u202f/g, " ")} vues</span>`
+    : ` <span style="color:var(--faint)">sur ${cvsData.length.toLocaleString("fr-FR").replace(/\u202f/g, " ")} au total</span>`;
+  if (countEl) countEl.innerHTML = totalLabel + filterLabel;
 
+  // ─── RENDU ───
   grid.innerHTML = "";
-  if (!filtered.length) {
+  if (!cvFiltered.length) {
     grid.innerHTML = `<div class="state-empty">Aucune CV trouvée pour ces critères.</div>`;
     return;
   }
 
-  filtered.forEach(cv => {
+  cvFiltered.forEach(cv => {
     const card = document.createElement("div");
     card.className = "card cv-list-card";
     card.style.cursor = "pointer";
 
+    // Échappe les caractères HTML dangereux
+    const esc = s => String(s || "").replace(/[&<>"']/g, m => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[m]));
+
+    const safeTitle    = esc(cv.title);
+    const safeUploader = esc(cv.uploader);
+
     // Thumbnail YouTube
     const thumbHtml = cv.videoId
-      ? `<div class="cv-list-thumb"><img src="https://img.youtube.com/vi/${cv.videoId}/hqdefault.jpg" alt="${cv.title}" loading="lazy" onerror="this.src='https://img.youtube.com/vi/${cv.videoId}/default.jpg'" ></div>`
+      ? `<div class="cv-list-thumb"><img src="https://img.youtube.com/vi/${cv.videoId}/hqdefault.jpg" alt="${safeTitle}" loading="lazy" onerror="this.src='https://img.youtube.com/vi/${cv.videoId}/default.jpg'" ></div>`
       : "";
 
+    // Note : le nombre de vues est masqué côté UI mais reste utilisé pour le filtre/tri
     card.innerHTML = `
       ${thumbHtml}
       <div class="cv-list-body">
-        <div class="cv-list-title">${cv.title}</div>
-        ${cv.dateDisplay ? `<div class="cv-list-date">${cv.dateDisplay}</div>` : ""}
-        ${cv.uploader ? `<div class="cv-list-uploader">${cv.uploader}</div>` : ""}
+        <div class="cv-list-title">${safeTitle}</div>
+        <div class="cv-list-meta-row">
+          ${cv.dateDisplay ? `<span class="cv-list-date">${esc(cv.dateDisplay)}</span>` : ""}
+        </div>
+        ${cv.uploader ? `<div class="cv-list-uploader">${safeUploader}</div>` : ""}
       </div>`;
 
     card.addEventListener("click", () => openCVProfile(cv));
@@ -2126,6 +2543,7 @@ function openCVProfile(cv) {
 
   const content = document.getElementById("profile-content");
 
+  // Note : le nombre de vues est masqué côté UI mais reste utilisé pour le filtre/tri
   content.innerHTML = `
     <div class="profile-hero" style="flex-direction:column; align-items:flex-start; gap:0.75rem; padding:1.5rem 2rem;">
       <div class="profile-name" style="font-size:24px; line-height:1.2;">${cv.title}</div>
@@ -2206,9 +2624,34 @@ function renderProfileCVs(entry) {
       color: var(--text);
       line-height: 1.25;
     }
+    .cv-list-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .cv-list-date {
       font-size: 11px;
       color: var(--faint);
+    }
+    .cv-list-views {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--orange);
+      font-family: 'Barlow Condensed', sans-serif;
+      letter-spacing: 0.02em;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .cv-list-views::before {
+      content: "";
+      display: inline-block;
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: var(--orange);
+      opacity: 0.5;
     }
     .cv-list-uploader {
       font-size: 11px;
